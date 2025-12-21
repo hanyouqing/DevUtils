@@ -1,0 +1,566 @@
+#!/bin/bash
+
+# Terraform Run Script
+# Usage: ./tfrun <environment> [terraform_command]
+# Example: ./tfrun production plan
+# Example: ./tfrun testing apply
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Allowed environments
+ALLOWED_ENVS=("sandbox" "development" "testing" "staging" "production")
+
+# Script directory (where this script is located)
+# Will be updated if --chdir is used
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Don't cd here yet - wait for --chdir processing
+
+# Function to print colored messages
+print_info() {
+    echo -e "${BLUE}ℹ${NC} $1"
+}
+
+print_success() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}✗${NC} $1"
+}
+
+# Function to execute command with output
+run_cmd() {
+    local cmd="$*"
+    echo -e "${BLUE}→${NC} Executing: ${YELLOW}$cmd${NC}"
+    eval "$cmd"
+}
+
+# Function to execute terraform command with automatic init on missing provider error
+run_terraform_cmd() {
+    local cmd="$*"
+    local max_retries=1
+    local retry_count=0
+    
+    while [ $retry_count -le $max_retries ]; do
+        # Capture both stdout and stderr
+        local output
+        local exit_code
+        
+        # Execute command and capture output and exit code
+        output=$(eval "$cmd" 2>&1)
+        exit_code=$?
+        
+        # Print the output
+        echo "$output"
+        
+        # Check if command succeeded
+        if [ $exit_code -eq 0 ]; then
+            return 0
+        fi
+        
+        # Check if error contains "Missing required provider"
+        if echo "$output" | grep -qi "Missing required provider"; then
+            if [ $retry_count -lt $max_retries ]; then
+                retry_count=$((retry_count + 1))
+                echo ""
+                print_warning "Detected missing provider error, automatically running terraform init..."
+                print_info "This may happen when provider configuration changes or .terraform directory is incomplete"
+                echo ""
+                
+                # Run terraform init
+                run_cmd "terraform init"
+                if [ $? -eq 0 ]; then
+                    print_success "Terraform init completed, retrying command..."
+                    echo ""
+                    # Continue to retry the command
+                    continue
+                else
+                    print_error "Terraform init failed"
+                    return 1
+                fi
+            else
+                print_error "Command failed with missing provider error after automatic init retry"
+                return $exit_code
+            fi
+        else
+            # Other error, return immediately
+            return $exit_code
+        fi
+    done
+    
+    # Should not reach here, but return exit code just in case
+    return $exit_code
+}
+
+# Function to show usage
+show_usage() {
+    cat << EOF
+Usage: $0 [OPTIONS] [terraform_command] [terraform_args...]
+
+Options:
+  -e, --environment <env>   Environment name (required)
+                           Allowed values: ${ALLOWED_ENVS[*]}
+  --chdir <dir>            Change to directory before executing
+                           Example: --chdir=./vpc or --chdir ./vpc
+  -h, --help               Show this help message
+
+Arguments:
+  terraform_command        Optional Terraform command to execute
+                          Examples: plan, apply, destroy, validate, fmt
+                          If not provided, will run: terraform validate && terraform apply
+  
+  terraform_args           Additional arguments passed directly to terraform command
+                          Examples: -target=resource.name, -out=tfplan, -var key=value
+                          All arguments after terraform_command are passed through to terraform
+
+Examples:
+  # Default: validate and apply
+  $0 -e testing
+  
+  # With command
+  $0 -e testing plan
+  $0 -e production apply
+  
+  # With chdir
+  $0 -e testing --chdir=./vpc plan
+  $0 --chdir=./ecs -e production apply
+  
+  # With Terraform arguments
+  $0 -e testing plan -out=tfplan -target=aws_instance.example
+  $0 -e production apply -auto-approve -target=aws_instance.example
+  $0 -e testing plan -var-file=custom.tfvars -out=tfplan
+
+This script will:
+  1. Change to specified directory (if --chdir provided)
+  2. Pull latest code from git
+  3. Validate environment name
+  4. Create symlink: terraform.tfvars -> environments/{env}.tfvars
+  5. Initialize Terraform (if needed)
+  6. Select or create Terraform workspace
+  7. Execute Terraform command (if provided)
+     If no command is provided, will run: terraform validate && terraform apply
+
+EOF
+}
+
+# Parse command line arguments
+ENV=""
+TF_COMMAND=""
+CHDIR=""
+TF_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -e|--environment)
+            ENV="$2"
+            shift 2
+            ;;
+        --chdir)
+            # Support both --chdir=value and --chdir value formats
+            if [[ "$2" == *"="* ]]; then
+                CHDIR="${2#*=}"
+                shift 2
+            else
+                CHDIR="$2"
+                shift 2
+            fi
+            ;;
+        --chdir=*)
+            CHDIR="${1#*=}"
+            shift
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        -*)
+            print_error "Unknown option: $1"
+            echo ""
+            show_usage
+            exit 1
+            ;;
+        *)
+            # Positional argument - terraform command or its arguments
+            if [ -z "$TF_COMMAND" ]; then
+                # First positional arg is terraform command
+                TF_COMMAND="$1"
+            else
+                # Remaining args are terraform arguments
+                TF_ARGS+=("$1")
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Check if environment is provided
+if [ -z "$ENV" ]; then
+    print_error "Environment is required. Use -e or --environment option"
+    echo ""
+    show_usage
+    exit 1
+fi
+
+# Change to specified directory if --chdir provided
+if [ -n "$CHDIR" ]; then
+    # Resolve relative paths relative to original script directory
+    ORIGINAL_SCRIPT_DIR="$SCRIPT_DIR"
+    if [[ "$CHDIR" != /* ]]; then
+        # Relative path - resolve from original script directory
+        if [ -d "$ORIGINAL_SCRIPT_DIR/$CHDIR" ]; then
+            CHDIR="$(cd "$ORIGINAL_SCRIPT_DIR" && cd "$CHDIR" && pwd)"
+        elif [ -d "$CHDIR" ]; then
+            # Try relative to current directory
+            CHDIR="$(cd "$CHDIR" && pwd)"
+        fi
+    fi
+    if [ ! -d "$CHDIR" ]; then
+        print_error "Directory does not exist: $CHDIR"
+        exit 1
+    fi
+    print_info "Changing to directory: ${YELLOW}$CHDIR${NC}"
+    cd "$CHDIR"
+    # Update SCRIPT_DIR to new directory
+    SCRIPT_DIR="$(pwd)"
+else
+    # No --chdir specified, use current working directory
+    # This allows the script to work when installed in ~/.local/bin
+    SCRIPT_DIR="$(pwd)"
+fi
+
+# Validate environment name
+if [[ ! " ${ALLOWED_ENVS[@]} " =~ " ${ENV} " ]]; then
+    print_error "Invalid environment: '$ENV'"
+    echo ""
+    print_info "Allowed environments: ${ALLOWED_ENVS[*]}"
+    exit 1
+fi
+
+# Set AWS_DEFAULT_REGION based on environment
+case "$ENV" in
+    production)
+        export AWS_DEFAULT_REGION="ap-southeast-1"
+        print_info "Setting ${GREEN}AWS_DEFAULT_REGION=${YELLOW}ap-southeast-1${NC} for ${GREEN}production${NC} environment"
+        ;;
+    testing)
+        export AWS_DEFAULT_REGION="ap-northeast-1"
+        print_info "Setting ${GREEN}AWS_DEFAULT_REGION=${YELLOW}ap-northeast-1${NC} for ${GREEN}testing${NC} environment"
+        ;;
+    *)
+        # For other environments, keep existing AWS_DEFAULT_REGION or use default
+        if [ -z "$AWS_DEFAULT_REGION" ]; then
+            export AWS_DEFAULT_REGION="ap-southeast-1"
+            print_info "Setting ${GREEN}AWS_DEFAULT_REGION=${YELLOW}ap-southeast-1${NC} (default) for ${GREEN}$ENV${NC} environment"
+        else
+            print_info "Using existing ${GREEN}AWS_DEFAULT_REGION=${YELLOW}$AWS_DEFAULT_REGION${NC} for ${GREEN}$ENV${NC} environment"
+        fi
+        ;;
+esac
+
+# Check if terraform is installed
+if ! command -v terraform &> /dev/null; then
+    print_error "Terraform is not installed or not in PATH"
+    print_info "Please install Terraform: https://www.terraform.io/downloads"
+    exit 1
+fi
+
+# Check if git is installed
+if ! command -v git &> /dev/null; then
+    print_error "Git is not installed or not in PATH"
+    exit 1
+fi
+
+# Check if we're in a git repository
+if [ ! -d ".git" ] && [ ! -f "../.git/config" ]; then
+    print_warning "Not in a git repository, skipping git pull"
+else
+    # Determine git root (could be in parent directory)
+    GIT_ROOT="$SCRIPT_DIR"
+    if [ -d "../.git" ]; then
+        GIT_ROOT="$(cd .. && pwd)"
+    fi
+    
+    print_info "Pulling latest code from git..."
+    cd "$GIT_ROOT"
+    
+    # Get current branch name
+    CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    
+    if [ -n "$CURRENT_BRANCH" ]; then
+        # Check if branch has upstream tracking
+        UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || echo "")
+        
+        if [ -n "$UPSTREAM" ]; then
+            # Branch has upstream, pull normally
+            run_cmd "git pull"
+            if [ $? -eq 0 ]; then
+                print_success "Git pull completed"
+            else
+                print_warning "Git pull failed or no changes"
+            fi
+        else
+            # No upstream tracking, try to pull from origin with same branch name
+            print_info "Current branch ${GREEN}'$CURRENT_BRANCH'${NC} has no upstream tracking"
+            print_info "Attempting to pull from ${YELLOW}origin/$CURRENT_BRANCH${NC}..."
+            run_cmd "git pull origin \"$CURRENT_BRANCH\""
+            if [ $? -eq 0 ]; then
+                print_success "Git pull completed from ${YELLOW}origin/$CURRENT_BRANCH${NC}"
+            else
+                print_warning "Git pull failed, branch may not exist on remote or no changes"
+            fi
+        fi
+    else
+        print_warning "Not on a git branch, skipping git pull"
+    fi
+    
+    cd "$SCRIPT_DIR"
+fi
+
+# Check if environments directory exists
+if [ ! -d "environments" ]; then
+    print_error "environments directory not found"
+    exit 1
+fi
+
+# Check if environment tfvars file exists
+ENV_TFVARS="environments/${ENV}.tfvars"
+if [ ! -f "$ENV_TFVARS" ]; then
+    print_error "Environment tfvars file not found: $ENV_TFVARS"
+    print_info "Available environments:"
+    ls -1 environments/*.tfvars 2>/dev/null | sed 's|environments/||' | sed 's|\.tfvars||' | sed 's/^/  - /' || echo "  (none found)"
+    exit 1
+fi
+
+# Create symlink for terraform.tfvars
+print_info "Setting up symlink: ${GREEN}terraform.tfvars${NC} -> ${YELLOW}$ENV_TFVARS${NC}"
+
+if [ -L "terraform.tfvars" ]; then
+    # Check if existing symlink points to the correct file
+    LINK_TARGET=$(readlink -f terraform.tfvars)
+    EXPECTED_TARGET=$(readlink -f "$ENV_TFVARS")
+    
+    if [ "$LINK_TARGET" = "$EXPECTED_TARGET" ]; then
+        print_info "Symlink already points to correct file: ${YELLOW}$ENV_TFVARS${NC}"
+    else
+        print_warning "Existing symlink points to different file: $LINK_TARGET"
+        print_info "Removing existing symlink and creating new one..."
+        run_cmd "rm -f terraform.tfvars"
+        run_cmd "ln -sf \"$ENV_TFVARS\" terraform.tfvars"
+        print_success "Symlink updated: ${GREEN}terraform.tfvars${NC} -> ${YELLOW}$ENV_TFVARS${NC}"
+    fi
+elif [ -f "terraform.tfvars" ]; then
+    # Regular file exists, check if it's the same file as expected
+    FILE_PATH=$(readlink -f terraform.tfvars)
+    EXPECTED_PATH=$(readlink -f "$ENV_TFVARS")
+    
+    if [ "$FILE_PATH" = "$EXPECTED_PATH" ]; then
+        # Same file, just convert to symlink
+        print_info "terraform.tfvars is already the correct file, converting to symlink..."
+        run_cmd "rm -f terraform.tfvars"
+        run_cmd "ln -sf \"$ENV_TFVARS\" terraform.tfvars"
+        print_success "Converted to symlink: ${GREEN}terraform.tfvars${NC} -> ${YELLOW}$ENV_TFVARS${NC}"
+    else
+        # Different file, remove and create symlink
+        print_warning "terraform.tfvars exists as a regular file pointing to different environment"
+        print_info "Removing existing file and creating symlink to: ${YELLOW}$ENV_TFVARS${NC}"
+        run_cmd "rm -f terraform.tfvars"
+        run_cmd "ln -sf \"$ENV_TFVARS\" terraform.tfvars"
+        print_success "Removed existing file and created symlink: ${GREEN}terraform.tfvars${NC} -> ${YELLOW}$ENV_TFVARS${NC}"
+    fi
+else
+    # No terraform.tfvars exists, create symlink
+    run_cmd "ln -sf \"$ENV_TFVARS\" terraform.tfvars"
+    print_success "Symlink created: ${GREEN}terraform.tfvars${NC} -> ${YELLOW}$ENV_TFVARS${NC}"
+fi
+
+# Initialize Terraform if needed
+if [ ! -d ".terraform" ]; then
+    print_info "Initializing Terraform..."
+    run_cmd "terraform init"
+    if [ $? -eq 0 ]; then
+        print_success "Terraform initialized"
+    else
+        print_error "Terraform initialization failed"
+        exit 1
+    fi
+else
+    print_info "Terraform already initialized"
+fi
+
+# Function to save workspace list to .terraform/workspaces
+save_workspace_list() {
+    local workspace_file=".terraform/workspaces"
+    print_info "Saving workspace list to $workspace_file..."
+    terraform workspace list > "$workspace_file" 2>/dev/null || true
+    if [ -f "$workspace_file" ]; then
+        print_success "Workspace list saved to $workspace_file"
+    fi
+}
+
+# Check if .terraform/environment exists and matches the requested environment
+WORKSPACE_SKIP=false
+if [ -f ".terraform/environment" ]; then
+    CURRENT_ENV_FILE=$(cat .terraform/environment 2>/dev/null | tr -d '\n\r' || echo "")
+    if [ "$CURRENT_ENV_FILE" = "$ENV" ]; then
+        print_info "Found .terraform/environment file with matching workspace: $ENV"
+        print_info "Workspace is already selected, skipping workspace setup"
+        WORKSPACE_SKIP=true
+    else
+        print_info "Found .terraform/environment file with different workspace: $CURRENT_ENV_FILE"
+        print_info "Will switch to requested workspace: $ENV"
+    fi
+fi
+
+# Only setup workspace if not already on the correct one
+if [ "$WORKSPACE_SKIP" = false ]; then
+    # Check current workspace
+    print_info "Checking current workspace..."
+    echo -e "${BLUE}→${NC} Executing: ${YELLOW}terraform workspace show${NC}"
+    CURRENT_WORKSPACE=$(terraform workspace show 2>/dev/null || echo "default")
+    echo "$CURRENT_WORKSPACE"
+
+    # Select or create workspace
+    print_info "Setting up Terraform workspace: $ENV"
+    echo -e "${BLUE}→${NC} Executing: ${YELLOW}terraform workspace list${NC}"
+    terraform workspace list
+    
+    # Save workspace list after listing
+    save_workspace_list
+
+    # Check if workspace exists (workspace list output may have * prefix for current workspace)
+    # Pattern matches: "  workspace" or "* workspace" or "  workspace " or "* workspace "
+    WORKSPACE_EXISTS=$(terraform workspace list | grep -E "^\s*\*?\s*${ENV}\s*$" || echo "")
+
+    if [ -n "$WORKSPACE_EXISTS" ]; then
+        # Workspace already exists, just select it (in case we're not already on it)
+        print_info "Workspace '$ENV' already exists, selecting it..."
+        run_cmd "terraform workspace select \"$ENV\""
+        print_success "Selected existing workspace: $ENV"
+    else
+        # Workspace does not exist, create it
+        print_info "Workspace '$ENV' does not exist, creating it..."
+        run_cmd "terraform workspace new \"$ENV\""
+        print_success "Created and selected new workspace: $ENV"
+        
+        # Save workspace list after creating new workspace
+        save_workspace_list
+    fi
+
+    # Verify workspace is selected
+    print_info "Verifying workspace selection..."
+    echo -e "${BLUE}→${NC} Executing: ${YELLOW}terraform workspace show${NC}"
+    ACTUAL_WORKSPACE=$(terraform workspace show)
+    echo "$ACTUAL_WORKSPACE"
+    if [ "$ACTUAL_WORKSPACE" != "$ENV" ]; then
+        print_error "Failed to select workspace '$ENV'. Current workspace: $ACTUAL_WORKSPACE"
+        exit 1
+    fi
+
+    print_success "Workspace setup complete: $ENV"
+else
+    # Verify the workspace file still matches (double-check)
+    VERIFY_ENV=$(cat .terraform/environment 2>/dev/null | tr -d '\n\r' || echo "")
+    if [ "$VERIFY_ENV" = "$ENV" ]; then
+        print_success "Workspace already set to: ${GREEN}$ENV${NC} (verified from .terraform/environment)"
+    else
+        print_warning "Workspace file mismatch, will proceed with workspace setup"
+        WORKSPACE_SKIP=false
+        # Re-run workspace setup
+        print_info "Setting up Terraform workspace: $ENV"
+        echo -e "${BLUE}→${NC} Executing: ${YELLOW}terraform workspace list${NC}"
+        terraform workspace list
+        save_workspace_list
+        
+        WORKSPACE_EXISTS=$(terraform workspace list | grep -E "^\s*\*?\s*${ENV}\s*$" || echo "")
+        if [ -n "$WORKSPACE_EXISTS" ]; then
+            run_cmd "terraform workspace select \"$ENV\""
+            print_success "Selected existing workspace: $ENV"
+        else
+            run_cmd "terraform workspace new \"$ENV\""
+            print_success "Created and selected new workspace: $ENV"
+            save_workspace_list
+        fi
+    fi
+fi
+
+# Execute Terraform command if provided, otherwise run default commands
+if [ -n "$TF_COMMAND" ]; then
+    echo ""
+    # Build full command with arguments
+    TF_FULL_CMD="terraform $TF_COMMAND"
+    
+    # Check if -var-file is already specified in arguments
+    HAS_VAR_FILE=false
+    for arg in "${TF_ARGS[@]}"; do
+        if [[ "$arg" == "-var-file"* ]] || [[ "$arg" == "--var-file"* ]]; then
+            HAS_VAR_FILE=true
+            break
+        fi
+    done
+    
+    # For plan/apply/destroy, automatically add -var-file if terraform.tfvars is a symlink and -var-file not specified
+    case "$TF_COMMAND" in
+        plan|apply|destroy)
+            if [ -L "terraform.tfvars" ] && [ "$HAS_VAR_FILE" = false ]; then
+                TF_FULL_CMD="$TF_FULL_CMD -var-file=\"terraform.tfvars\""
+            fi
+            ;;
+    esac
+    
+    # Add all remaining terraform arguments
+    if [ ${#TF_ARGS[@]} -gt 0 ]; then
+        TF_FULL_CMD="$TF_FULL_CMD ${TF_ARGS[*]}"
+    fi
+    
+    print_info "Executing: ${YELLOW}$TF_FULL_CMD${NC}"
+    echo "=========================================="
+    
+    # Execute the command with automatic init on missing provider error
+    run_terraform_cmd "$TF_FULL_CMD"
+    if [ $? -ne 0 ]; then
+        exit 1
+    fi
+else
+    # Default: run validate and apply
+    echo ""
+    print_info "No command specified, running default: ${YELLOW}validate${NC} and ${YELLOW}apply${NC}"
+    echo "=========================================="
+    
+    # Run terraform validate
+    echo ""
+    print_info "Step 1: Running terraform ${YELLOW}validate${NC}..."
+    run_terraform_cmd "terraform validate"
+    if [ $? -eq 0 ]; then
+        print_success "Terraform validation passed"
+    else
+        print_error "Terraform validation failed"
+        exit 1
+    fi
+    
+    # Run terraform apply
+    echo ""
+    print_info "Step 2: Running terraform ${YELLOW}apply${NC}..."
+    print_warning "This will apply changes to the ${GREEN}'$ENV'${NC} environment"
+    
+    # Use -var-file if terraform.tfvars is a symlink
+    if [ -L "terraform.tfvars" ]; then
+        run_terraform_cmd "terraform apply -var-file=\"terraform.tfvars\""
+    else
+        run_terraform_cmd "terraform apply"
+    fi
+    if [ $? -ne 0 ]; then
+        exit 1
+    fi
+fi
+
