@@ -52,50 +52,73 @@ run_terraform_cmd() {
     local max_retries=1
     local retry_count=0
     
+    # Check if command is interactive (apply, destroy without -auto-approve)
+    local is_interactive=false
+    if echo "$cmd" | grep -qE "\b(apply|destroy)\b" && ! echo "$cmd" | grep -qE "\b-auto-approve\b"; then
+        is_interactive=true
+    fi
+    
     while [ $retry_count -le $max_retries ]; do
-        # Capture both stdout and stderr
         local output
         local exit_code
         
-        # Execute command and capture output and exit code
-        output=$(eval "$cmd" 2>&1)
-        exit_code=$?
-        
-        # Print the output
-        echo "$output"
-        
-        # Check if command succeeded
-        if [ $exit_code -eq 0 ]; then
-            return 0
-        fi
-        
-        # Check if error contains "Missing required provider"
-        if echo "$output" | grep -qi "Missing required provider"; then
-            if [ $retry_count -lt $max_retries ]; then
-                retry_count=$((retry_count + 1))
-                echo ""
-                print_warning "Detected missing provider error, automatically running terraform init..."
-                print_info "This may happen when provider configuration changes or .terraform directory is incomplete"
-                echo ""
-                
-                # Run terraform init
-                run_cmd "terraform init"
-                if [ $? -eq 0 ]; then
-                    print_success "Terraform init completed, retrying command..."
+        if [ "$is_interactive" = true ]; then
+            # For interactive commands, execute directly without capturing output
+            # This allows user to see prompts and provide input
+            eval "$cmd"
+            exit_code=$?
+            
+            # For interactive commands, if successful, return immediately
+            if [ $exit_code -eq 0 ]; then
+                return 0
+            fi
+            
+            # If failed, we can't capture the output for error checking
+            # So we'll try to run init if it might be a provider issue
+            # But we can't detect "Missing required provider" without capturing output
+            # So we'll just return the exit code
+            return $exit_code
+        else
+            # For non-interactive commands, capture output to check for errors
+            output=$(eval "$cmd" 2>&1)
+            exit_code=$?
+            
+            # Print the output
+            echo "$output"
+            
+            # Check if command succeeded
+            if [ $exit_code -eq 0 ]; then
+                return 0
+            fi
+            
+            # Check if error contains "Missing required provider"
+            if echo "$output" | grep -qi "Missing required provider"; then
+                if [ $retry_count -lt $max_retries ]; then
+                    retry_count=$((retry_count + 1))
                     echo ""
-                    # Continue to retry the command
-                    continue
+                    print_warning "Detected missing provider error, automatically running terraform init..."
+                    print_info "This may happen when provider configuration changes or .terraform directory is incomplete"
+                    echo ""
+                    
+                    # Run terraform init
+                    run_cmd "terraform init"
+                    if [ $? -eq 0 ]; then
+                        print_success "Terraform init completed, retrying command..."
+                        echo ""
+                        # Continue to retry the command
+                        continue
+                    else
+                        print_error "Terraform init failed"
+                        return 1
+                    fi
                 else
-                    print_error "Terraform init failed"
-                    return 1
+                    print_error "Command failed with missing provider error after automatic init retry"
+                    return $exit_code
                 fi
             else
-                print_error "Command failed with missing provider error after automatic init retry"
+                # Other error, return immediately
                 return $exit_code
             fi
-        else
-            # Other error, return immediately
-            return $exit_code
         fi
     done
     
