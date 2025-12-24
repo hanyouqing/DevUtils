@@ -52,9 +52,11 @@ run_terraform_cmd() {
     local max_retries=1
     local retry_count=0
     
-    # Check if command is interactive (apply, destroy without -auto-approve)
+    # Check if command is interactive (apply, destroy without -auto-approve, force-unlock without -force)
     local is_interactive=false
     if echo "$cmd" | grep -qE "\b(apply|destroy)\b" && ! echo "$cmd" | grep -qE "\b-auto-approve\b"; then
+        is_interactive=true
+    elif echo "$cmd" | grep -qE "\bforce-unlock\b" && ! echo "$cmd" | grep -qE "\b-force\b"; then
         is_interactive=true
     fi
     
