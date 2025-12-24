@@ -306,7 +306,7 @@ fi
 
 # Check if we're in a git repository
 if [ ! -d ".git" ] && [ ! -f "../.git/config" ]; then
-    print_warning "Not in a git repository, skipping git pull"
+    print_warning "Not in a git repository, skipping git operations"
 else
     # Determine git root (could be in parent directory)
     GIT_ROOT="$SCRIPT_DIR"
@@ -314,11 +314,35 @@ else
         GIT_ROOT="$(cd .. && pwd)"
     fi
     
-    print_info "Pulling latest code from git..."
     cd "$GIT_ROOT"
     
-    # Get current branch name
+    # Get current branch name and display it
     CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    
+    if [ -n "$CURRENT_BRANCH" ]; then
+        # Get commit hash (short version)
+        COMMIT_HASH=$(git rev-parse --short HEAD 2>/dev/null || echo "")
+        
+        # Check if there are uncommitted changes
+        if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+            DIRTY_STATUS="${YELLOW}*${NC}"
+        else
+            DIRTY_STATUS=""
+        fi
+        
+        # Display current branch with highlighting
+        echo ""
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${BLUE}📦${NC} Git Repository Information:"
+        echo -e "   Branch: ${GREEN}${CURRENT_BRANCH}${NC}${DIRTY_STATUS}"
+        if [ -n "$COMMIT_HASH" ]; then
+            echo -e "   Commit: ${YELLOW}${COMMIT_HASH}${NC}"
+        fi
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo ""
+    fi
+    
+    print_info "Pulling latest code from git..."
     
     if [ -n "$CURRENT_BRANCH" ]; then
         # Check if branch has upstream tracking
