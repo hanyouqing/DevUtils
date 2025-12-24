@@ -574,8 +574,11 @@ if [ -n "$TF_COMMAND" ]; then
     echo "=========================================="
     
     # Execute the command with automatic init on missing provider error
+    set +e
     run_terraform_cmd "$TF_FULL_CMD"
-    if [ $? -ne 0 ]; then
+    cmd_exit=$?
+    set -e
+    if [ $cmd_exit -ne 0 ]; then
         exit 1
     fi
 else
@@ -587,8 +590,11 @@ else
     # Run terraform validate
     echo ""
     print_info "Step 1: Running terraform ${YELLOW}validate${NC}..."
+    set +e
     run_terraform_cmd "terraform validate"
-    if [ $? -eq 0 ]; then
+    validate_exit=$?
+    set -e
+    if [ $validate_exit -eq 0 ]; then
         print_success "Terraform validation passed"
     else
         print_error "Terraform validation failed"
@@ -601,12 +607,15 @@ else
     print_warning "This will apply changes to the ${GREEN}'$ENV'${NC} environment"
     
     # Use -var-file if terraform.tfvars is a symlink
+    set +e
     if [ -L "terraform.tfvars" ]; then
         run_terraform_cmd "terraform apply -var-file=\"terraform.tfvars\""
     else
         run_terraform_cmd "terraform apply"
     fi
-    if [ $? -ne 0 ]; then
+    apply_exit=$?
+    set -e
+    if [ $apply_exit -ne 0 ]; then
         exit 1
     fi
 fi
